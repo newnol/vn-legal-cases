@@ -28,6 +28,7 @@ Schema này áp dụng cho ba file `raw.md`, `summary.md`, `structured.md` của
 | `case_number` | string | số bản án/quyết định |
 | `decision_date` | date or null | ngày ra bản án |
 | `publication_date` | date or null | ngày công bố trên cổng |
+| `year` | string | năm dùng để sắp xếp thư mục case |
 | `case_type` | string | ví dụ `Hình sự`, `Dân sự`, `Hành chính` |
 | `domain` | string | slug thư mục, ví dụ `hinh-su` |
 | `proceeding_stage` | string or null | ví dụ `Sơ thẩm`, `Phúc thẩm` |
@@ -92,6 +93,7 @@ document_kind: "Bản án"
 case_number: "88"
 decision_date: "2026-04-06"
 publication_date: "2026-04-15"
+year: "2026"
 case_type: "Hình sự"
 domain: "hinh-su"
 proceeding_stage: "Phúc thẩm"
@@ -162,3 +164,9 @@ notes: null
 ## Judgment
 ...
 ```
+
+### `pdf.md`
+
+- Sidecar riêng cho job PDF.
+- Dùng để chứa markdown trích xuất từ `files/source.pdf`.
+- Không bắt buộc trong MVP metadata-only, nhưng khuyến nghị tạo khi PDF text extract được.

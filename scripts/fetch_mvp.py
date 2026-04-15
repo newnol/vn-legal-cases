@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import logging
 import os
 import shutil
@@ -11,6 +12,7 @@ from dataclasses import dataclass
 from urllib.parse import urlencode
 from pathlib import Path
 from typing import Any
+import uuid
 
 import requests
 import urllib3
@@ -28,7 +30,9 @@ from common import (
     clean_inline_whitespace,
     clean_multiline_text,
     dedupe_preserve_order,
+    derive_case_year,
     domain_slug,
+    case_output_dir,
     ensure_dirs,
     extract_keywords,
     extract_source_case_id,
@@ -57,6 +61,10 @@ class ResponseLike:
     url: str
     text: str
 
+    def raise_for_status(self) -> None:
+        if self.status_code >= 400:
+            raise requests.exceptions.HTTPError(f"{self.status_code} Client Error for url: {self.url}")
+
 
 class PortalClient:
     def __init__(self, *, delay_seconds: float, timeout_seconds: float, verify: bool | str) -> None:
@@ -72,7 +80,7 @@ class PortalClient:
         )
         self._last_request_at = 0.0
         self._use_curl_fallback = False
-        self._cookie_jar_path = Path(tempfile.gettempdir()) / f"vn-legal-cases-cookies-{os.getpid()}.txt"
+        self._cookie_jar_path = Path(tempfile.gettempdir()) / f"vn-legal-cases-cookies-{os.getpid()}-{uuid.uuid4().hex}.txt"
 
     def _respect_delay(self) -> None:
         now = time.monotonic()
@@ -191,6 +199,8 @@ class PortalClient:
                         effective_url = lines[-1]
 
                     body_text = body_path.read_text(encoding="utf-8", errors="replace")
+                    if http_code >= 400:
+                        raise RuntimeError(f"curl returned HTTP {http_code} for {method} {url}")
                     if profile_name != "default":
                         LOGGER.warning(
                             "curl succeeded for %s %s using TLS profile %s",
@@ -320,6 +330,7 @@ def parse_detail_page(html: str, *, source_url: str) -> dict[str, Any]:
     summary_text = field_map.get("Thông tin về vụ án")
     case_type = field_map.get("Loại án")
     keywords = extract_keywords(title=raw_title, case_type=case_type, summary_text=summary_text)
+    year = derive_case_year(decision_date=decision_date, publication_date=publication_date)
 
     case_slug = build_case_slug(
         source_case_id=source_case_id,
@@ -353,6 +364,7 @@ def parse_detail_page(html: str, *, source_url: str) -> dict[str, Any]:
             "case_number": case_number,
             "decision_date": decision_date,
             "publication_date": publication_date,
+            "year": year,
             "title": raw_title or heading_text,
             "case_type": case_type,
             "domain": domain_slug(case_type),
@@ -381,6 +393,7 @@ def build_provisional_raw_markdown(case_meta: dict[str, Any]) -> str:
         f'case_number: {yaml_scalar(metadata.get("case_number"))}',
         f'decision_date: {yaml_scalar(metadata.get("decision_date"))}',
         f'publication_date: {yaml_scalar(metadata.get("publication_date"))}',
+        f'year: {yaml_scalar(metadata.get("year"))}',
         f'case_type: {yaml_scalar(metadata.get("case_type"))}',
         f'domain: {yaml_scalar(metadata.get("domain"))}',
         f'proceeding_stage: {yaml_scalar(metadata.get("proceeding_stage"))}',
@@ -408,6 +421,17 @@ def build_provisional_raw_markdown(case_meta: dict[str, Any]) -> str:
         "",
     ]
     return "\n".join(lines)
+
+
+def fetch_case_worker(
+    detail_url: str,
+    *,
+    delay_seconds: float,
+    timeout_seconds: float,
+    verify: bool | str,
+) -> dict[str, Any]:
+    client = PortalClient(delay_seconds=delay_seconds, timeout_seconds=timeout_seconds, verify=verify)
+    return client.fetch_case(detail_url)
 
 
 def parse_args() -> argparse.Namespace:
@@ -454,6 +478,12 @@ def parse_args() -> argparse.Namespace:
         "--queue-stats",
         action="store_true",
         help="Print frontier counts and exit.",
+    )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=4,
+        help="Concurrent fetch workers for detail pages. Use 1 to disable concurrency.",
     )
     parser.add_argument(
         "--seed-listing",
@@ -511,6 +541,8 @@ def main() -> int:
 
     if args.limit <= 0:
         raise SystemExit("--limit must be > 0")
+    if args.workers <= 0:
+        raise SystemExit("--workers must be > 0")
 
     output_root = Path(args.out_dir).expanduser().resolve()
     ensure_dirs(output_root)
@@ -588,47 +620,70 @@ def main() -> int:
         return 0
 
     processed = 0
-    for item in claimed_items:
-        detail_url = item.detail_url
-        LOGGER.info("Fetching %s", detail_url)
-        try:
-            case_meta = client.fetch_case(detail_url)
-        except Exception as exc:
-            frontier.mark_failed(detail_url, str(exc), retry_delay_seconds=args.retry_delay_seconds)
-            LOGGER.error("Failed %s: %s", detail_url, exc)
-            continue
 
+    def _persist_case(case_meta: dict[str, Any]) -> None:
         metadata = case_meta["metadata"]
         ids = case_meta["ids"]
-        case_dir = output_root / metadata["domain"] / ids["case_slug"]
+        year = metadata.get("year") or "unknown-year"
+        case_dir = case_output_dir(output_root, year=str(year), domain=metadata["domain"], case_slug=ids["case_slug"])
 
-        try:
-            if args.dry_run:
-                LOGGER.info(
-                    "[dry-run] %s | %s | %s",
-                    ids["source_case_id"],
-                    metadata.get("case_type"),
-                    metadata.get("title"),
+        if args.dry_run:
+            LOGGER.info(
+                "[dry-run] %s | %s | %s",
+                ids["source_case_id"],
+                metadata.get("case_type"),
+                metadata.get("title"),
+            )
+        else:
+            write_json(case_dir / "meta.json", case_meta)
+            write_text(case_dir / "raw.md", build_provisional_raw_markdown(case_meta))
+            LOGGER.info("Wrote %s", case_dir)
+
+        related_urls = metadata.get("related_detail_urls") or []
+        if related_urls:
+            frontier.upsert_urls(
+                related_urls,
+                discovery_source=f"related:{ids['source_case_id']}",
+                priority=80,
+            )
+
+    if args.workers == 1 or len(claimed_items) == 1:
+        for item in claimed_items:
+            detail_url = item.detail_url
+            LOGGER.info("Fetching %s", detail_url)
+            try:
+                case_meta = client.fetch_case(detail_url)
+                _persist_case(case_meta)
+                frontier.mark_fetched(detail_url)
+                processed += 1
+            except Exception as exc:
+                frontier.mark_failed(detail_url, str(exc), retry_delay_seconds=args.retry_delay_seconds)
+                LOGGER.error("Failed %s: %s", detail_url, exc)
+                continue
+    else:
+        futures: dict[Any, str] = {}
+        with ThreadPoolExecutor(max_workers=args.workers) as executor:
+            for item in claimed_items:
+                LOGGER.info("Fetching %s", item.detail_url)
+                future = executor.submit(
+                    fetch_case_worker,
+                    item.detail_url,
+                    delay_seconds=args.delay,
+                    timeout_seconds=args.timeout,
+                    verify=verify,
                 )
-            else:
-                write_json(case_dir / "meta.json", case_meta)
-                write_text(case_dir / "raw.md", build_provisional_raw_markdown(case_meta))
-                LOGGER.info("Wrote %s", case_dir)
+                futures[future] = item.detail_url
 
-            related_urls = metadata.get("related_detail_urls") or []
-            if related_urls:
-                frontier.upsert_urls(
-                    related_urls,
-                    discovery_source=f"related:{ids['source_case_id']}",
-                    priority=80,
-                )
-
-            frontier.mark_fetched(detail_url)
-            processed += 1
-        except Exception as exc:
-            frontier.mark_failed(detail_url, str(exc), retry_delay_seconds=args.retry_delay_seconds)
-            LOGGER.error("Failed while persisting %s: %s", detail_url, exc)
-            continue
+            for future in as_completed(futures):
+                detail_url = futures[future]
+                try:
+                    case_meta = future.result()
+                    _persist_case(case_meta)
+                    frontier.mark_fetched(detail_url)
+                    processed += 1
+                except Exception as exc:
+                    frontier.mark_failed(detail_url, str(exc), retry_delay_seconds=args.retry_delay_seconds)
+                    LOGGER.error("Failed %s: %s", detail_url, exc)
 
     counts = frontier.counts()
     LOGGER.info("Processed %s case(s).", processed)

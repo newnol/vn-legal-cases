@@ -7,6 +7,7 @@ document_kind: "Bản án"
 case_number: "01/2026/DS-ST"
 decision_date: "2026-01-15"
 publication_date: null
+year: "2026"
 case_type: "Dân sự"
 domain: "dan-su"
 proceeding_stage: "Sơ thẩm"

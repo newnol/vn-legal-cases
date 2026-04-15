@@ -13,7 +13,8 @@ Xây repo `vn-legal-cases` theo hướng:
 1. Metadata-first crawler ổn định cho `home + detail`.
 2. Frontier queue bền vững để tránh fetch trùng và hỗ trợ incremental runs.
 3. Reverse-engineer listing/search của ASP.NET WebForms để mở rộng coverage.
-4. Chỉ sau đó mới xét PDF pipeline, OCR, hoặc sync automation.
+4. Tách PDF ra job riêng, download song song và extract markdown.
+5. Chỉ sau đó mới xét OCR, checksum/versioning, hoặc sync automation.
 
 ## Working Rules
 
@@ -27,11 +28,11 @@ Xây repo `vn-legal-cases` theo hướng:
 - Repo skeleton, schema, samples, README, NOTICE.
 - MVP parser cho trang detail.
 - Frontier queue bằng SQLite tại `.runtime/state/frontier.db`.
-- `fetch_mvp.py` đã có seed, claim, retry, checkpoint cơ bản.
+- `fetch_mvp.py` đã có seed, claim, retry, checkpoint cơ bản và `--workers`.
+- `pdf_job.py` tải PDF riêng và sinh `pdf.md`.
 
 ## Near-Term Next Steps
 
 1. Bổ sung audit/status command riêng cho frontier.
 2. Thêm checksum/versioning để detect case updates.
-3. Tách phase tải PDF thành script độc lập.
-4. Nghiên cứu pagination listing sâu hơn với cửa sổ ngày hẹp hoặc page selector postback.
+3. Nghiên cứu pagination listing sâu hơn với cửa sổ ngày hẹp hoặc page selector postback.

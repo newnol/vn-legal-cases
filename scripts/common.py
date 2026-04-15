@@ -118,6 +118,13 @@ def normalize_portal_date(value: str | None) -> str | None:
     return None
 
 
+def derive_case_year(*, decision_date: str | None, publication_date: str | None) -> str:
+    for value in (decision_date, publication_date):
+        if value and len(value) >= 4 and value[:4].isdigit():
+            return value[:4]
+    return "unknown-year"
+
+
 def today_utc_iso() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
@@ -133,6 +140,10 @@ def domain_slug(case_type: str | None) -> str:
         return "khac"
     cleaned = clean_inline_whitespace(case_type)
     return DOMAIN_BY_CASE_TYPE.get(cleaned, slugify(cleaned))
+
+
+def case_output_dir(root: Path, *, year: str, domain: str, case_slug: str) -> Path:
+    return root / year / domain / case_slug
 
 
 def extract_source_case_id(source_url: str) -> str:

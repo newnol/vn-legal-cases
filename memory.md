@@ -19,10 +19,16 @@
 - Crawl strategy mặc định: metadata-first, incremental, dedupe bằng frontier queue.
 - Queue backend: SQLite file `.runtime/state/frontier.db`.
 - Resume strategy: tự reclaim item `fetching` bị stale; vẫn có `--reset-fetching` để ép thu hồi thủ công.
+- Layout output mới ưu tiên `data/<year>/<domain>/<slug>/` để batch theo năm.
+- PDF được tách job riêng `scripts/pdf_job.py`, tạo `files/source.pdf` và `pdf.md`.
+- `fetch_mvp.py` đã hỗ trợ concurrency có kiểm soát bằng `--workers`.
 
 ## Latest Verification
 
 - `python3 -m compileall scripts`: passed.
+- `python3 scripts/pdf_job.py --help`: passed.
+- `python3 scripts/fetch_mvp.py --help`: passed.
+- `python3 scripts/normalize_case.py --help`: passed.
 - Smoke test with frontier queue to `/tmp`:
   - fetched `1` case successfully;
   - frontier grew to `39` URLs total;
@@ -47,4 +53,4 @@ python3 scripts/normalize_case.py --root /tmp/vn-legal-cases-smoke
 
 1. Có endpoint/postback nào cho listing cho phép discovery coverage tốt hơn mà không cần browser automation?
 2. Có nên lưu metadata crawl trung gian vào repo hay chỉ để trong storage/runtime?
-3. Khi nào cần phase tải PDF riêng, và phase đó có được commit public hay chỉ private?
+3. Có nên thêm checksum để detect case/PDF update theo thời gian không?

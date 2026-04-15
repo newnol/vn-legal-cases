@@ -1,6 +1,6 @@
 # vn-legal-cases
 
-Repo corpus riêng cho bản án, quyết định và vụ việc của Việt Nam, tách biệt khỏi corpus văn bản quy phạm pháp luật. Mục tiêu của repo này là chuẩn hóa metadata, duy trì layout `raw/summary/structured`, và thử nghiệm pipeline crawl tối thiểu trước khi scale.
+Repo corpus riêng cho bản án, quyết định và vụ việc của Việt Nam, tách biệt khỏi corpus văn bản quy phạm pháp luật. Mục tiêu của repo này là chuẩn hóa metadata, duy trì layout `raw/summary/structured`, tách job tải PDF ra riêng, và thử nghiệm pipeline crawl tối thiểu trước khi scale.
 
 ## Trạng thái hiện tại
 
@@ -41,12 +41,14 @@ vn-legal-cases/
 │       ├── summary.md
 │       └── structured.md
 ├── data/
-│   ├── dan-su/
-│   ├── hinh-su/
-│   └── hanh-chinh/
+│   ├── 2026/
+│   │   ├── dan-su/
+│   │   └── hinh-su/
+│   └── unknown-year/
 └── scripts/
     ├── common.py
     ├── fetch_mvp.py
+    ├── pdf_job.py
     ├── normalize_case.py
     └── requirements.txt
 ```
@@ -55,8 +57,9 @@ vn-legal-cases/
 
 1. Fetch seed URLs từ trang chủ của cổng công bố.
 2. Tải trang chi tiết, lấy metadata và link PDF, rồi lưu `meta.json` + `raw.md`.
-3. Chạy chuẩn hóa để dựng frontmatter thống nhất và tạo template `summary.md` / `structured.md`.
-4. QA thủ công một số hồ sơ trước khi mở rộng phạm vi crawl.
+3. Chạy `pdf_job.py` để tải PDF riêng và trích xuất `pdf.md` theo lô song song.
+4. Chạy chuẩn hóa để dựng frontmatter thống nhất và tạo template `summary.md` / `structured.md`.
+5. QA thủ công một số hồ sơ trước khi mở rộng phạm vi crawl.
 
 ## Frontier Queue
 
@@ -117,7 +120,7 @@ Nếu `requests` vẫn bị TLS EOF trên worker, crawler sẽ tự thử lại 
 Chạy với frontier + seed từ trang chủ:
 
 ```bash
-python3 scripts/fetch_mvp.py --seed-home --limit 10 --out-dir ./tmp-cases --insecure
+python3 scripts/fetch_mvp.py --seed-home --limit 10 --workers 4 --out-dir ./tmp-cases --insecure
 ```
 
 Chạy với listing discovery hẹp theo cửa sổ ngày:
@@ -146,6 +149,7 @@ Chuẩn hóa dữ liệu vừa fetch:
 
 ```bash
 python3 scripts/normalize_case.py --root ./tmp-cases
+python3 scripts/pdf_job.py --root ./tmp-cases --workers 4 --insecure
 ```
 
 ## Quy ước dữ liệu
@@ -153,7 +157,9 @@ python3 scripts/normalize_case.py --root ./tmp-cases
 - `raw.md`: capture gần nguồn nhất ở mức MVP; hiện có thể chỉ chứa metadata + tóm tắt HTML + link PDF.
 - `summary.md`: tóm tắt do người hoặc model tạo sau.
 - `structured.md`: facts / issues / reasoning / judgment ở dạng có cấu trúc.
+- `pdf.md`: markdown trích xuất từ PDF ở job riêng; file nhị phân nằm ở `files/source.pdf`.
 - `laws_cited[].law_id`: quy ước dùng VBPL `id` làm khóa canonical khi nối với repo luật.
+- Output thư mục mới ưu tiên theo `data/<year>/<domain>/<slug>/` để dễ batch theo năm.
 
 Chi tiết schema ở [schema/case_schema.md](schema/case_schema.md).
 

@@ -11,6 +11,7 @@ from common import (
     clean_inline_whitespace,
     dedupe_preserve_order,
     domain_slug,
+    derive_case_year,
     ensure_dirs,
     extract_keywords,
     extract_laws_cited,
@@ -33,6 +34,7 @@ SIMPLE_FIELD_ORDER = [
     "case_number",
     "decision_date",
     "publication_date",
+    "year",
     "case_type",
     "domain",
     "proceeding_stage",
@@ -99,6 +101,10 @@ def normalize_record(meta: dict[str, Any]) -> dict[str, Any]:
     summary_text = clean_inline_whitespace(metadata.get("summary_text") or "")
     title = clean_inline_whitespace(metadata.get("title") or "")
     case_type = metadata.get("case_type")
+    year = metadata.get("year") or derive_case_year(
+        decision_date=metadata.get("decision_date"),
+        publication_date=metadata.get("publication_date"),
+    )
     keywords = dedupe_preserve_order(
         (metadata.get("keywords") or []) + extract_keywords(title=title, case_type=case_type, summary_text=summary_text)
     )
@@ -118,6 +124,7 @@ def normalize_record(meta: dict[str, Any]) -> dict[str, Any]:
         "case_number": metadata.get("case_number"),
         "decision_date": metadata.get("decision_date"),
         "publication_date": metadata.get("publication_date"),
+        "year": year,
         "case_type": case_type,
         "domain": metadata.get("domain") or domain_slug(case_type),
         "proceeding_stage": metadata.get("proceeding_stage"),
