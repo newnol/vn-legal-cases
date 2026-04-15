@@ -20,7 +20,7 @@
 - Queue backend: SQLite file `.runtime/state/frontier.db`.
 - Resume strategy: tự reclaim item `fetching` bị stale; vẫn có `--reset-fetching` để ép thu hồi thủ công.
 - Layout output mới ưu tiên `data/<year>/<domain>/<slug>/` để batch theo năm.
-- PDF được tách job riêng `scripts/pdf_job.py`, tạo `files/source.pdf` và `pdf.md`.
+- PDF được tách job riêng `scripts/pdf_job.py`, ưu tiên tải/cached `files/source.pdf` trước để OCR/extract sau.
 - `fetch_mvp.py` đã hỗ trợ concurrency có kiểm soát bằng `--workers`.
 
 ## Latest Verification
@@ -46,8 +46,10 @@
 python3 scripts/fetch_mvp.py --seed-home --limit 10 --dry-run --insecure
 python3 scripts/fetch_mvp.py --seed-home --limit 10 --out-dir /tmp/vn-legal-cases-smoke --insecure
 python3 scripts/fetch_mvp.py --queue-stats
-python3 scripts/normalize_case.py --root /tmp/vn-legal-cases-smoke
+python3 scripts/pdf_job.py --root /tmp/vn-legal-cases-smoke --workers 4 --insecure
 ```
+
+`normalize_case.py` remains available, but is no longer part of the default flow.
 
 ## Open Questions
 

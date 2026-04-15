@@ -294,53 +294,36 @@ def process_item(item: PdfWorkItem, *, force: bool, timeout_seconds: float, veri
             pdf_md_path.unlink()
         if pdf_path.exists():
             pdf_path.unlink()
-    if not force and pdf_path.exists() and pdf_md_path.exists():
-        return PdfResult(case_dir=item.case_dir, pdf_path=pdf_path, pdf_md_path=pdf_md_path, status="skipped", message="Already extracted")
 
     pdf_path.parent.mkdir(parents=True, exist_ok=True)
-    download_path = pdf_path.with_suffix(".part")
-    if download_path.exists():
-        download_path.unlink()
 
     client = PortalBinaryClient(timeout_seconds=timeout_seconds, verify=verify)
     source_url = str(item.record.get("source_url") or item.meta_path.as_uri())
 
     try:
-        client.download(str(pdf_url), referer=source_url, output_path=download_path)
-        download_path.replace(pdf_path)
-        pages = extract_pdf_pages(pdf_path)
-        markdown = build_pdf_markdown(
-            record,
-            page_count=len(pages),
-            pages=pages,
-            source_pdf=pdf_path,
-            source_url=source_url,
-        )
-        write_text(pdf_md_path, markdown)
-        return PdfResult(case_dir=item.case_dir, pdf_path=pdf_path, pdf_md_path=pdf_md_path, status="ok")
+        if force or not pdf_path.exists():
+            download_path = pdf_path.with_suffix(".part")
+            if download_path.exists():
+                download_path.unlink()
+
+            client.download(str(pdf_url), referer=source_url, output_path=download_path)
+            download_path.replace(pdf_path)
+
+        if pdf_path.exists():
+            return PdfResult(case_dir=item.case_dir, pdf_path=pdf_path, pdf_md_path=pdf_md_path if pdf_md_path.exists() else None, status="ok")
+
+        return PdfResult(case_dir=item.case_dir, pdf_path=None, pdf_md_path=None, status="skipped", message="PDF not downloaded")
     except Exception as exc:
-        if download_path.exists():
-            download_path.unlink(missing_ok=True)
-        if pdf_path.exists() and not pdf_md_path.exists():
-            pdf_md_path.write_text(
-                build_pdf_error_markdown(
-                    record,
-                    source_pdf=pdf_path,
-                    source_url=source_url,
-                    error=str(exc),
-                ),
-                encoding="utf-8",
-            )
         return PdfResult(case_dir=item.case_dir, pdf_path=pdf_path if pdf_path.exists() else None, pdf_md_path=pdf_md_path if pdf_md_path.exists() else None, status="error", message=str(exc))
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Download PDF judgments and extract them into Markdown.")
+    parser = argparse.ArgumentParser(description="Download and cache PDF judgments.")
     parser.add_argument("--root", default=str(DATA_DIR), help="Root directory containing case meta.json files.")
     parser.add_argument("--workers", type=int, default=4, help="Number of concurrent PDF workers.")
     parser.add_argument("--limit", type=int, default=0, help="Limit the number of cases to process. 0 means all.")
     parser.add_argument("--year", action="append", default=[], help="Optional year filter. Repeat to process specific years only.")
-    parser.add_argument("--force", action="store_true", help="Re-download and re-extract even if pdf.md already exists.")
+    parser.add_argument("--force", action="store_true", help="Re-download cached PDFs even if source.pdf already exists.")
     parser.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT_SECONDS, help="Network timeout in seconds.")
     parser.add_argument("--ca-bundle", default=None, help="Path to a CA bundle file for TLS verification.")
     parser.add_argument("--insecure", action="store_true", help="Disable TLS verification for local spike/debug use only.")

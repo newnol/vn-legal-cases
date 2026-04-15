@@ -57,8 +57,8 @@ vn-legal-cases/
 
 1. Fetch seed URLs từ trang chủ của cổng công bố.
 2. Tải trang chi tiết, lấy metadata và link PDF, rồi lưu `meta.json` + `raw.md`.
-3. Chạy `pdf_job.py` để tải PDF riêng và trích xuất `pdf.md` theo lô song song.
-4. Chạy chuẩn hóa để dựng frontmatter thống nhất và tạo template `summary.md` / `structured.md`.
+3. Chạy `pdf_job.py` để tải và cache PDF riêng theo lô song song.
+4. Nếu cần, mới trích text hoặc OCR từ `files/source.pdf` ở bước riêng sau.
 5. QA thủ công một số hồ sơ trước khi mở rộng phạm vi crawl.
 
 ## Frontier Queue
@@ -145,10 +145,9 @@ Ghi ra thư mục chỉ định:
 python3 scripts/fetch_mvp.py --limit 5 --out-dir ./tmp-cases
 ```
 
-Chuẩn hóa dữ liệu vừa fetch:
+Tải PDF cho dữ liệu vừa fetch:
 
 ```bash
-python3 scripts/normalize_case.py --root ./tmp-cases
 python3 scripts/pdf_job.py --root ./tmp-cases --workers 4 --insecure
 ```
 
@@ -157,7 +156,7 @@ python3 scripts/pdf_job.py --root ./tmp-cases --workers 4 --insecure
 - `raw.md`: capture gần nguồn nhất ở mức MVP; hiện có thể chỉ chứa metadata + tóm tắt HTML + link PDF.
 - `summary.md`: tóm tắt do người hoặc model tạo sau.
 - `structured.md`: facts / issues / reasoning / judgment ở dạng có cấu trúc.
-- `pdf.md`: markdown trích xuất từ PDF ở job riêng; file nhị phân nằm ở `files/source.pdf`.
+- `files/source.pdf`: file PDF gốc đã tải về, giữ làm nguồn cho OCR hoặc trích xuất sau này.
 - `laws_cited[].law_id`: quy ước dùng VBPL `id` làm khóa canonical khi nối với repo luật.
 - Output thư mục mới ưu tiên theo `data/<year>/<domain>/<slug>/` để dễ batch theo năm.
 
