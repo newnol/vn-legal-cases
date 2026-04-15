@@ -112,7 +112,7 @@ python3 scripts/fetch_mvp.py --limit 5 --dry-run --insecure
 
 Nếu bạn thấy lỗi kiểu `SSLEOFError` hoặc `certificate verify failed`, chạy lại với `--insecure` gần như luôn là cách thử đầu tiên trên môi trường worker/Linux.
 
-Nếu `requests` vẫn bị TLS EOF trên worker, crawler sẽ tự thử lại bằng `curl` khi có sẵn trên máy.
+Nếu `requests` vẫn bị TLS EOF trên worker, crawler sẽ tự thử lại bằng `curl` khi có sẵn trên máy; nếu profile mặc định vẫn lỗi, nó sẽ thử thêm `--tlsv1.2` và `--tlsv1.2 --ciphers DEFAULT:@SECLEVEL=1` trước khi dừng.
 
 Chạy với frontier + seed từ trang chủ:
 

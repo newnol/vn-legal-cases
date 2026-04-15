@@ -130,7 +130,7 @@ class PortalClient:
 
         with tempfile.TemporaryDirectory(prefix="vn-legal-cases-curl-") as tmpdir:
             body_path = Path(tmpdir) / "body.txt"
-            command = [
+            base_command = [
                 curl,
                 "--silent",
                 "--show-error",
@@ -154,39 +154,60 @@ class PortalClient:
             ]
 
             if self.verify is False:
-                command.append("--insecure")
+                base_command.append("--insecure")
             elif isinstance(self.verify, str):
-                command.extend(["--cacert", self.verify])
+                base_command.extend(["--cacert", self.verify])
 
             if method.upper() == "POST":
-                command.extend(["--request", "POST", "--data-binary", "@-"])
+                base_command.extend(["--request", "POST", "--data-binary", "@-"])
                 payload = urlencode(data or {})
             else:
-                command.extend(["--request", "GET"])
+                base_command.extend(["--request", "GET"])
                 payload = None
 
-            result = subprocess.run(
-                command + [url],
-                input=payload,
-                text=True,
-                capture_output=True,
-                check=False,
-            )
+            profiles: list[tuple[str, list[str]]] = [
+                ("default", []),
+                ("tlsv1.2", ["--tlsv1.2"]),
+                ("tlsv1.2+lowsec", ["--tlsv1.2", "--ciphers", "DEFAULT:@SECLEVEL=1"]),
+            ]
+            errors: list[str] = []
 
-            if result.returncode != 0:
-                raise RuntimeError(
-                    f"curl request failed for {method} {url}: {result.stderr.strip() or result.stdout.strip()}"
+            for profile_name, extra_flags in profiles:
+                command = base_command + extra_flags + [url]
+                result = subprocess.run(
+                    command,
+                    input=payload,
+                    text=True,
+                    capture_output=True,
+                    check=False,
                 )
 
-            lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]
-            http_code = 200
-            effective_url = url
-            if len(lines) >= 2 and lines[-2].isdigit():
-                http_code = int(lines[-2])
-                effective_url = lines[-1]
+                if result.returncode == 0:
+                    lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+                    http_code = 200
+                    effective_url = url
+                    if len(lines) >= 2 and lines[-2].isdigit():
+                        http_code = int(lines[-2])
+                        effective_url = lines[-1]
 
-            body_text = body_path.read_text(encoding="utf-8", errors="replace")
-            return ResponseLike(status_code=http_code, url=effective_url, text=body_text)
+                    body_text = body_path.read_text(encoding="utf-8", errors="replace")
+                    if profile_name != "default":
+                        LOGGER.warning(
+                            "curl succeeded for %s %s using TLS profile %s",
+                            method,
+                            url,
+                            profile_name,
+                        )
+                    return ResponseLike(status_code=http_code, url=effective_url, text=body_text)
+
+                stderr = (result.stderr or result.stdout or "").strip()
+                errors.append(f"{profile_name}: {stderr or f'exit code {result.returncode}'}")
+                LOGGER.debug("curl profile %s failed for %s %s: %s", profile_name, method, url, stderr)
+
+            raise RuntimeError(
+                f"curl request failed for {method} {url} after trying TLS profiles: "
+                + " | ".join(errors)
+            )
 
     def fetch_seed_detail_urls(self) -> list[str]:
         response = self.get(HOME_URL)
