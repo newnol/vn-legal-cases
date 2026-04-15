@@ -1,0 +1,521 @@
+from __future__ import annotations
+
+import argparse
+import logging
+import time
+from pathlib import Path
+from typing import Any
+
+import requests
+import urllib3
+from bs4 import BeautifulSoup
+
+from common import (
+    DEFAULT_DELAY_SECONDS,
+    DEFAULT_TIMEOUT_SECONDS,
+    FRONTIER_DB_PATH,
+    HOME_URL,
+    LISTING_URL,
+    USER_AGENT,
+    absolute_url,
+    build_case_slug,
+    clean_inline_whitespace,
+    clean_multiline_text,
+    dedupe_preserve_order,
+    domain_slug,
+    ensure_dirs,
+    extract_keywords,
+    extract_source_case_id,
+    normalize_portal_date,
+    today_utc_iso,
+    write_json,
+    write_text,
+    yaml_scalar,
+)
+from frontier import FrontierStore
+from listing_search import (
+    CASE_TYPE_VALUE_BY_DOMAIN,
+    DOCUMENT_KIND_VALUE,
+    build_listing_page_form,
+    build_listing_search_form,
+    parse_listing_page,
+)
+
+
+LOGGER = logging.getLogger("fetch_mvp")
+
+
+class PortalClient:
+    def __init__(self, *, delay_seconds: float, timeout_seconds: float, verify: bool | str) -> None:
+        self.delay_seconds = delay_seconds
+        self.timeout_seconds = timeout_seconds
+        self.verify = verify
+        self.session = requests.Session()
+        self.session.headers.update(
+            {
+                "User-Agent": USER_AGENT,
+                "Accept-Language": "vi,en;q=0.8",
+            }
+        )
+        self._last_request_at = 0.0
+
+    def _respect_delay(self) -> None:
+        now = time.monotonic()
+        elapsed = now - self._last_request_at
+        if self._last_request_at and elapsed < self.delay_seconds:
+            time.sleep(self.delay_seconds - elapsed)
+
+    def get(self, url: str) -> requests.Response:
+        return self._request("GET", url)
+
+    def post(self, url: str, *, data: dict[str, str]) -> requests.Response:
+        return self._request("POST", url, data=data)
+
+    def _request(self, method: str, url: str, *, data: dict[str, str] | None = None) -> requests.Response:
+        self._respect_delay()
+        response = self.session.request(
+            method,
+            url,
+            data=data,
+            timeout=self.timeout_seconds,
+            verify=self.verify,
+        )
+        self._last_request_at = time.monotonic()
+
+        if response.status_code in {429, 503}:
+            raise RuntimeError(f"Portal returned {response.status_code}; stopping to avoid overload.")
+
+        response.raise_for_status()
+        return response
+
+    def fetch_seed_detail_urls(self) -> list[str]:
+        response = self.get(HOME_URL)
+        soup = BeautifulSoup(response.text, "lxml")
+        hrefs = [
+            absolute_url(anchor.get("href"))
+            for anchor in soup.select('a[href*="/chi-tiet-ban-an"]')
+            if anchor.get("href")
+        ]
+        return [href for href in dedupe_preserve_order(hrefs) if href]
+
+    def fetch_listing_results(
+        self,
+        *,
+        date_from: str | None,
+        date_to: str | None,
+        case_type_value: str | None,
+        document_kind_value: str | None,
+        page_limit: int,
+        keyword: str = "",
+    ) -> list[str]:
+        initial = self.get(LISTING_URL)
+        form = build_listing_search_form(
+            initial.text,
+            date_from=date_from,
+            date_to=date_to,
+            case_type_value=case_type_value,
+            document_kind_value=document_kind_value,
+            keyword=keyword,
+        )
+        search_response = self.post(LISTING_URL, data=form)
+        search_page = parse_listing_page(search_response.text)
+        detail_urls = [result.detail_url for result in search_page.results if result.detail_url]
+
+        max_page = min(page_limit, search_page.total_pages or page_limit)
+        current_html = search_response.text
+        for page_number in range(2, max_page + 1):
+            page_form = build_listing_page_form(current_html, page=page_number)
+            page_response = self.post(LISTING_URL, data=page_form)
+            current_html = page_response.text
+            parsed = parse_listing_page(current_html)
+            detail_urls.extend(result.detail_url for result in parsed.results if result.detail_url)
+
+        return dedupe_preserve_order(detail_urls)
+
+    def fetch_case(self, detail_url: str) -> dict[str, Any]:
+        response = self.get(detail_url)
+        return parse_detail_page(response.text, source_url=str(response.url))
+
+
+def parse_detail_page(html: str, *, source_url: str) -> dict[str, Any]:
+    soup = BeautifulSoup(html, "lxml")
+    source_case_id = extract_source_case_id(source_url)
+
+    metadata_panel = soup.select_one("div.panel.panel-blue")
+    if metadata_panel is None:
+        raise ValueError(f"Could not find metadata panel in {source_url}")
+
+    heading_text = clean_inline_whitespace(metadata_panel.select_one(".panel-heading strong").get_text(" ", strip=True))
+    heading_match = None
+    if heading_text:
+        import re
+
+        heading_match = re.search(r"(.+?)\s+ngày\s+(\d{2}/\d{2}/\d{4})", heading_text)
+
+    field_map: dict[str, str] = {}
+    for item in metadata_panel.select("ul.list-group > li.list-group-item"):
+        label = item.select_one("label")
+        if label is None:
+            continue
+        label_text = clean_inline_whitespace(label.get_text(" ", strip=True)).rstrip(":")
+        full_text = clean_multiline_text(item.get_text("\n", strip=True)).replace("\n", " ")
+        value = full_text.replace(label_text, "", 1).lstrip(": ").strip()
+        field_map[label_text] = clean_inline_whitespace(value)
+
+    raw_title = field_map.get("Tên bản án", "")
+    publication_date = None
+    if raw_title.endswith(")"):
+        import re
+
+        publication_match = re.search(r"\((\d{2}[./]\d{2}[./]\d{4})\)\s*$", raw_title)
+        if publication_match:
+            publication_date = normalize_portal_date(publication_match.group(1))
+            raw_title = raw_title[: publication_match.start()].rstrip(" -")
+
+    document_kind = "Quyết định" if raw_title.lower().startswith("quyết định") else "Bản án"
+    case_number = None
+    decision_date = None
+    if heading_match:
+        import re
+
+        raw_case_number = clean_inline_whitespace(heading_match.group(1))
+        number_match = re.search(r"(?:Bản án|Quyết định)\s+số:?\s*(.+)", raw_case_number, flags=re.IGNORECASE)
+        case_number = clean_inline_whitespace(number_match.group(1)) if number_match else raw_case_number
+        decision_date = normalize_portal_date(heading_match.group(2))
+
+    pdf_anchor = soup.select_one('a[href$=".pdf"]')
+    iframe = soup.select_one("iframe#iframe_pub")
+    related_urls = [
+        absolute_url(anchor.get("href"))
+        for anchor in soup.select('a[href*="/chi-tiet-ban-an"]')
+        if anchor.get("href")
+    ]
+    related_urls = [
+        url
+        for url in dedupe_preserve_order(related_urls)
+        if url and url != source_url
+    ]
+
+    summary_text = field_map.get("Thông tin về vụ án")
+    case_type = field_map.get("Loại án")
+    keywords = extract_keywords(title=raw_title, case_type=case_type, summary_text=summary_text)
+
+    case_slug = build_case_slug(
+        source_case_id=source_case_id,
+        document_kind=document_kind,
+        case_number=case_number,
+        decision_date=decision_date,
+        court=field_map.get("Tòa án xét xử"),
+    )
+
+    return {
+        "ids": {
+            "source_case_id": source_case_id,
+            "case_slug": case_slug,
+            "case_id": f"ta-{source_case_id}",
+        },
+        "source": {
+            "name": "congbobanan.toaan.gov.vn",
+            "detail_url": source_url,
+            "pdf_url": absolute_url(pdf_anchor.get("href")) if pdf_anchor else None,
+            "viewer_url": absolute_url(iframe.get("src")) if iframe else None,
+            "seed_source": HOME_URL,
+            "fetched_at": today_utc_iso(),
+            "user_agent": USER_AGENT,
+            "redistribution_notice": (
+                "Portal footer indicates reposting or reissuing information/data "
+                "requires written permission from the Supreme People's Court of Vietnam."
+            ),
+        },
+        "metadata": {
+            "document_kind": document_kind,
+            "case_number": case_number,
+            "decision_date": decision_date,
+            "publication_date": publication_date,
+            "title": raw_title or heading_text,
+            "case_type": case_type,
+            "domain": domain_slug(case_type),
+            "proceeding_stage": field_map.get("Cấp xét xử"),
+            "court": field_map.get("Tòa án xét xử"),
+            "applied_precedent": field_map.get("Áp dụng án lệ"),
+            "correction_count": field_map.get("Đính chính"),
+            "summary_text": summary_text,
+            "keywords": keywords,
+            "related_detail_urls": related_urls,
+        },
+    }
+
+
+def build_provisional_raw_markdown(case_meta: dict[str, Any]) -> str:
+    ids = case_meta["ids"]
+    source = case_meta["source"]
+    metadata = case_meta["metadata"]
+    lines = [
+        "---",
+        f'case_id: {yaml_scalar(ids["case_id"])}',
+        f'source_case_id: {yaml_scalar(ids["source_case_id"])}',
+        f'slug: {yaml_scalar(ids["case_slug"])}',
+        f'title: {yaml_scalar(metadata.get("title"))}',
+        f'document_kind: {yaml_scalar(metadata.get("document_kind"))}',
+        f'case_number: {yaml_scalar(metadata.get("case_number"))}',
+        f'decision_date: {yaml_scalar(metadata.get("decision_date"))}',
+        f'publication_date: {yaml_scalar(metadata.get("publication_date"))}',
+        f'case_type: {yaml_scalar(metadata.get("case_type"))}',
+        f'domain: {yaml_scalar(metadata.get("domain"))}',
+        f'proceeding_stage: {yaml_scalar(metadata.get("proceeding_stage"))}',
+        f'court: {yaml_scalar(metadata.get("court"))}',
+        f'source: {yaml_scalar(source.get("name"))}',
+        f'source_url: {yaml_scalar(source.get("detail_url"))}',
+        f'pdf_url: {yaml_scalar(source.get("pdf_url"))}',
+        f'viewer_url: {yaml_scalar(source.get("viewer_url"))}',
+        'status: "raw"',
+        'visibility: "restricted-source"',
+        'language: "vi"',
+        "---",
+        "",
+        "# Raw Capture",
+        "",
+        "## Source Summary",
+        "",
+        metadata.get("summary_text") or "MVP mới thu được metadata HTML và link PDF; full text extraction còn để bước sau.",
+        "",
+        "## Retrieval Notes",
+        "",
+        f"- Captured from: {source.get('detail_url')}",
+        "- Public redistribution should be reviewed before committing raw full text.",
+        "- This MVP does not OCR or extract full text from the linked PDF.",
+        "",
+    ]
+    return "\n".join(lines)
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Fetch a minimal set of case records from congbobanan.toaan.gov.vn.")
+    parser.add_argument("--limit", type=int, default=5, help="Maximum number of cases to fetch.")
+    parser.add_argument("--delay", type=float, default=DEFAULT_DELAY_SECONDS, help="Delay between requests in seconds.")
+    parser.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT_SECONDS, help="HTTP timeout in seconds.")
+    parser.add_argument("--out-dir", default=str(Path.cwd() / "data"), help="Output root for case folders.")
+    parser.add_argument("--dry-run", action="store_true", help="Fetch and parse but do not write files.")
+    parser.add_argument(
+        "--detail-url",
+        action="append",
+        default=[],
+        help="Optional explicit detail URL. Repeat to seed additional URLs.",
+    )
+    parser.add_argument(
+        "--queue-db",
+        default=str(FRONTIER_DB_PATH),
+        help="Path to the SQLite frontier database.",
+    )
+    parser.add_argument(
+        "--seed-home",
+        action="store_true",
+        help="Seed the frontier from the homepage before fetching.",
+    )
+    parser.add_argument(
+        "--reset-fetching",
+        action="store_true",
+        help="Move stuck `fetching` items back to `discovered` before claiming new work.",
+    )
+    parser.add_argument(
+        "--fetching-stale-after-seconds",
+        type=int,
+        default=900,
+        help="Auto-reclaim `fetching` items older than this many seconds. Use 0 to disable.",
+    )
+    parser.add_argument(
+        "--retry-delay-seconds",
+        type=int,
+        default=900,
+        help="Delay before a failed URL becomes eligible again.",
+    )
+    parser.add_argument(
+        "--queue-stats",
+        action="store_true",
+        help="Print frontier counts and exit.",
+    )
+    parser.add_argument(
+        "--seed-listing",
+        action="store_true",
+        help="Seed the frontier from the listing/search form.",
+    )
+    parser.add_argument(
+        "--listing-date-from",
+        default=None,
+        help="Listing filter `Từ ngày` in dd/MM/yyyy.",
+    )
+    parser.add_argument(
+        "--listing-date-to",
+        default=None,
+        help="Listing filter `Đến ngày` in dd/MM/yyyy.",
+    )
+    parser.add_argument(
+        "--listing-domain",
+        default="hinh-su",
+        help="Domain slug used to choose the listing case type filter.",
+    )
+    parser.add_argument(
+        "--listing-document-kind",
+        default="ban-an",
+        choices=["ban-an", "quyet-dinh"],
+        help="Listing document kind filter.",
+    )
+    parser.add_argument(
+        "--listing-pages",
+        type=int,
+        default=1,
+        help="Maximum number of listing pages to seed per query.",
+    )
+    parser.add_argument(
+        "--listing-keyword",
+        default="",
+        help="Optional keyword for listing search.",
+    )
+    parser.add_argument(
+        "--ca-bundle",
+        default=None,
+        help="Path to a CA bundle file for TLS verification.",
+    )
+    parser.add_argument(
+        "--insecure",
+        action="store_true",
+        help="Disable TLS certificate verification for local spike/debug use only.",
+    )
+    return parser.parse_args()
+
+
+def main() -> int:
+    args = parse_args()
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+
+    if args.limit <= 0:
+        raise SystemExit("--limit must be > 0")
+
+    output_root = Path(args.out_dir).expanduser().resolve()
+    ensure_dirs(output_root)
+    frontier = FrontierStore(Path(args.queue_db).expanduser().resolve())
+
+    verify: bool | str = True
+    if args.ca_bundle:
+        verify = str(Path(args.ca_bundle).expanduser().resolve())
+    elif args.insecure:
+        verify = False
+        LOGGER.warning("TLS verification is disabled for this run (`--insecure`).")
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+    client = PortalClient(delay_seconds=args.delay, timeout_seconds=args.timeout, verify=verify)
+
+    if args.reset_fetching:
+        reset_count = frontier.reset_fetching()
+        LOGGER.info("Reset %s stuck `fetching` item(s).", reset_count)
+    elif args.fetching_stale_after_seconds > 0:
+        reclaimed = frontier.reclaim_stale_fetching(
+            stale_after_seconds=args.fetching_stale_after_seconds
+        )
+        if reclaimed:
+            LOGGER.info(
+                "Reclaimed %s stale `fetching` item(s) older than %ss.",
+                reclaimed,
+                args.fetching_stale_after_seconds,
+            )
+
+    explicit_seed_urls = dedupe_preserve_order([url for url in args.detail_url if url])
+    if explicit_seed_urls:
+        frontier.upsert_urls(explicit_seed_urls, discovery_source="cli", priority=10)
+
+    if args.seed_home or (not explicit_seed_urls and not args.queue_stats and not args.seed_listing):
+        LOGGER.info("Fetching seed detail URLs from homepage...")
+        home_seed_urls = client.fetch_seed_detail_urls()
+        frontier.upsert_urls(home_seed_urls, discovery_source="home", priority=20)
+
+    if args.seed_listing:
+        case_type_value = CASE_TYPE_VALUE_BY_DOMAIN.get(args.listing_domain, "")
+        document_kind_value = DOCUMENT_KIND_VALUE.get(args.listing_document_kind, "")
+        LOGGER.info(
+            "Fetching listing seeds domain=%s kind=%s pages=%s range=%s..%s",
+            args.listing_domain,
+            args.listing_document_kind,
+            args.listing_pages,
+            args.listing_date_from,
+            args.listing_date_to,
+        )
+        listing_urls = client.fetch_listing_results(
+            date_from=args.listing_date_from,
+            date_to=args.listing_date_to,
+            case_type_value=case_type_value,
+            document_kind_value=document_kind_value,
+            page_limit=max(args.listing_pages, 1),
+            keyword=args.listing_keyword,
+        )
+        frontier.upsert_urls(listing_urls, discovery_source="listing", priority=30)
+        LOGGER.info("Seeded %s detail URL(s) from listing.", len(listing_urls))
+
+    if args.queue_stats:
+        counts = frontier.counts()
+        for key in sorted(counts):
+            LOGGER.info("%s=%s", key, counts[key])
+        frontier.close()
+        return 0
+
+    claimed_items = frontier.claim_batch(args.limit)
+    if not claimed_items:
+        LOGGER.info("No eligible items found in frontier.")
+        counts = frontier.counts()
+        for key in sorted(counts):
+            LOGGER.info("%s=%s", key, counts[key])
+        frontier.close()
+        return 0
+
+    processed = 0
+    for item in claimed_items:
+        detail_url = item.detail_url
+        LOGGER.info("Fetching %s", detail_url)
+        try:
+            case_meta = client.fetch_case(detail_url)
+        except Exception as exc:
+            frontier.mark_failed(detail_url, str(exc), retry_delay_seconds=args.retry_delay_seconds)
+            LOGGER.error("Failed %s: %s", detail_url, exc)
+            continue
+
+        metadata = case_meta["metadata"]
+        ids = case_meta["ids"]
+        case_dir = output_root / metadata["domain"] / ids["case_slug"]
+
+        try:
+            if args.dry_run:
+                LOGGER.info(
+                    "[dry-run] %s | %s | %s",
+                    ids["source_case_id"],
+                    metadata.get("case_type"),
+                    metadata.get("title"),
+                )
+            else:
+                write_json(case_dir / "meta.json", case_meta)
+                write_text(case_dir / "raw.md", build_provisional_raw_markdown(case_meta))
+                LOGGER.info("Wrote %s", case_dir)
+
+            related_urls = metadata.get("related_detail_urls") or []
+            if related_urls:
+                frontier.upsert_urls(
+                    related_urls,
+                    discovery_source=f"related:{ids['source_case_id']}",
+                    priority=80,
+                )
+
+            frontier.mark_fetched(detail_url)
+            processed += 1
+        except Exception as exc:
+            frontier.mark_failed(detail_url, str(exc), retry_delay_seconds=args.retry_delay_seconds)
+            LOGGER.error("Failed while persisting %s: %s", detail_url, exc)
+            continue
+
+    counts = frontier.counts()
+    LOGGER.info("Processed %s case(s).", processed)
+    for key in sorted(counts):
+        LOGGER.info("%s=%s", key, counts[key])
+    frontier.close()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

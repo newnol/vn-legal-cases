@@ -1,0 +1,14 @@
+Source and redistribution notice for `vn-legal-cases`
+
+1. This repository contains original code, schema notes, and synthetic samples.
+2. The default upstream source for the MVP spike is the public portal at:
+   - https://congbobanan.toaan.gov.vn/
+   - https://congbobanan.toaan.gov.vn/0tat1cvn/ban-an-quyet-dinh
+3. As checked on 2026-04-15, the portal footer states in substance that reposting or reissuing information/data from the portal requires prior written permission from the Supreme People's Court of Vietnam.
+4. Because of that notice, any fetched case data should be treated as source-constrained unless a separate permission or policy review says otherwise.
+5. Safe public default for this repo:
+   - publish metadata, source links, and locally created summaries only;
+   - keep full-text raw captures private or uncommitted by default;
+   - manually review any excerpt before publishing.
+6. `LICENSE` covers repository code and original docs only, not third-party court data or PDFs.
+7. This repository is for legal information retrieval research and engineering, not legal advice.
