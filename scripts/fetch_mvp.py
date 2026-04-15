@@ -2,7 +2,13 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
+import shutil
 import time
+import subprocess
+import tempfile
+from dataclasses import dataclass
+from urllib.parse import urlencode
 from pathlib import Path
 from typing import Any
 
@@ -45,6 +51,13 @@ from listing_search import (
 LOGGER = logging.getLogger("fetch_mvp")
 
 
+@dataclass(slots=True)
+class ResponseLike:
+    status_code: int
+    url: str
+    text: str
+
+
 class PortalClient:
     def __init__(self, *, delay_seconds: float, timeout_seconds: float, verify: bool | str) -> None:
         self.delay_seconds = delay_seconds
@@ -58,6 +71,8 @@ class PortalClient:
             }
         )
         self._last_request_at = 0.0
+        self._use_curl_fallback = False
+        self._cookie_jar_path = Path(tempfile.gettempdir()) / f"vn-legal-cases-cookies-{os.getpid()}.txt"
 
     def _respect_delay(self) -> None:
         now = time.monotonic()
@@ -65,37 +80,113 @@ class PortalClient:
         if self._last_request_at and elapsed < self.delay_seconds:
             time.sleep(self.delay_seconds - elapsed)
 
-    def get(self, url: str) -> requests.Response:
+    def get(self, url: str) -> ResponseLike:
         return self._request("GET", url)
 
-    def post(self, url: str, *, data: dict[str, str]) -> requests.Response:
+    def post(self, url: str, *, data: dict[str, str]) -> ResponseLike:
         return self._request("POST", url, data=data)
 
-    def _request(self, method: str, url: str, *, data: dict[str, str] | None = None) -> requests.Response:
+    def _request(self, method: str, url: str, *, data: dict[str, str] | None = None) -> ResponseLike:
         self._respect_delay()
         try:
-            response = self.session.request(
-                method,
-                url,
-                data=data,
-                timeout=self.timeout_seconds,
-                verify=self.verify,
-            )
+            if self._use_curl_fallback:
+                response = self._request_with_curl(method, url, data=data)
+            else:
+                response = self.session.request(
+                    method,
+                    url,
+                    data=data,
+                    timeout=self.timeout_seconds,
+                    verify=self.verify,
+                )
         except requests.exceptions.SSLError as exc:
-            verify_mode = "disabled (`--insecure`)" if self.verify is False else "enabled"
-            raise RuntimeError(
-                "TLS handshake failed while talking to congbobanan.toaan.gov.vn. "
-                f"Current verification mode: {verify_mode}. "
-                "Try `--insecure` for a local spike, or pass `--ca-bundle /path/to/cacert.pem` "
-                "if your environment has a custom trust store."
-            ) from exc
+            if shutil.which("curl"):
+                LOGGER.warning("Switching to curl transport after TLS failure on %s %s", method, url)
+                self._use_curl_fallback = True
+                response = self._request_with_curl(method, url, data=data)
+            else:
+                verify_mode = "disabled (`--insecure`)" if self.verify is False else "enabled"
+                raise RuntimeError(
+                    "TLS handshake failed while talking to congbobanan.toaan.gov.vn. "
+                    f"Current verification mode: {verify_mode}. "
+                    "Try `--insecure` for a local spike, or pass `--ca-bundle /path/to/cacert.pem` "
+                    "if your environment has a custom trust store."
+                ) from exc
+        except requests.exceptions.RequestException as exc:
+            raise RuntimeError(f"HTTP request failed for {method} {url}: {exc}") from exc
         self._last_request_at = time.monotonic()
 
         if response.status_code in {429, 503}:
             raise RuntimeError(f"Portal returned {response.status_code}; stopping to avoid overload.")
 
-        response.raise_for_status()
+        if hasattr(response, "raise_for_status"):
+            response.raise_for_status()
         return response
+
+    def _request_with_curl(self, method: str, url: str, *, data: dict[str, str] | None = None) -> ResponseLike:
+        curl = shutil.which("curl")
+        if not curl:
+            raise RuntimeError("curl is not available in this environment.")
+
+        with tempfile.TemporaryDirectory(prefix="vn-legal-cases-curl-") as tmpdir:
+            body_path = Path(tmpdir) / "body.txt"
+            command = [
+                curl,
+                "--silent",
+                "--show-error",
+                "--location",
+                "--compressed",
+                "--http1.1",
+                "--user-agent",
+                USER_AGENT,
+                "--header",
+                "Accept-Language: vi,en;q=0.8",
+                "--cookie",
+                str(self._cookie_jar_path),
+                "--cookie-jar",
+                str(self._cookie_jar_path),
+                "--output",
+                str(body_path),
+                "--write-out",
+                "%{http_code}\\n%{url_effective}\\n",
+                "--max-time",
+                str(int(self.timeout_seconds)),
+            ]
+
+            if self.verify is False:
+                command.append("--insecure")
+            elif isinstance(self.verify, str):
+                command.extend(["--cacert", self.verify])
+
+            if method.upper() == "POST":
+                command.extend(["--request", "POST", "--data-binary", "@-"])
+                payload = urlencode(data or {})
+            else:
+                command.extend(["--request", "GET"])
+                payload = None
+
+            result = subprocess.run(
+                command + [url],
+                input=payload,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+            if result.returncode != 0:
+                raise RuntimeError(
+                    f"curl request failed for {method} {url}: {result.stderr.strip() or result.stdout.strip()}"
+                )
+
+            lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+            http_code = 200
+            effective_url = url
+            if len(lines) >= 2 and lines[-2].isdigit():
+                http_code = int(lines[-2])
+                effective_url = lines[-1]
+
+            body_text = body_path.read_text(encoding="utf-8", errors="replace")
+            return ResponseLike(status_code=http_code, url=effective_url, text=body_text)
 
     def fetch_seed_detail_urls(self) -> list[str]:
         response = self.get(HOME_URL)
