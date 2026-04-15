@@ -110,6 +110,8 @@ python3 scripts/fetch_mvp.py --limit 5 --dry-run --insecure
 
 `--insecure` chỉ nên dùng cho kiểm tra kỹ thuật cục bộ, không nên là mặc định khi scale.
 
+Nếu bạn thấy lỗi kiểu `SSLEOFError` hoặc `certificate verify failed`, chạy lại với `--insecure` gần như luôn là cách thử đầu tiên trên môi trường worker/Linux.
+
 Chạy với frontier + seed từ trang chủ:
 
 ```bash

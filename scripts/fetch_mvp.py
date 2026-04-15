@@ -73,13 +73,22 @@ class PortalClient:
 
     def _request(self, method: str, url: str, *, data: dict[str, str] | None = None) -> requests.Response:
         self._respect_delay()
-        response = self.session.request(
-            method,
-            url,
-            data=data,
-            timeout=self.timeout_seconds,
-            verify=self.verify,
-        )
+        try:
+            response = self.session.request(
+                method,
+                url,
+                data=data,
+                timeout=self.timeout_seconds,
+                verify=self.verify,
+            )
+        except requests.exceptions.SSLError as exc:
+            verify_mode = "disabled (`--insecure`)" if self.verify is False else "enabled"
+            raise RuntimeError(
+                "TLS handshake failed while talking to congbobanan.toaan.gov.vn. "
+                f"Current verification mode: {verify_mode}. "
+                "Try `--insecure` for a local spike, or pass `--ca-bundle /path/to/cacert.pem` "
+                "if your environment has a custom trust store."
+            ) from exc
         self._last_request_at = time.monotonic()
 
         if response.status_code in {429, 503}:
